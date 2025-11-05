@@ -1,5 +1,5 @@
 import streamlit as st
-from langgraph_backend import chatbot
+from langgraph_backend import chatbot,title_llm
 from langchain_core.messages import HumanMessage
 import uuid # generates random thread ids
 
@@ -8,29 +8,21 @@ import uuid # generates random thread ids
 # You should use a separate, simple LLM (not the stateful chatbot)
 # to generate a title.
 def get_ai_title_for_query(query: str) -> str:
-    """
-    Generates a concise, AI-powered title (5 words or less) for a user's query.
-
-    --- IMPLEMENTATION (EXAMPLE) ---
-    
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    
-    # Initialize this once (e.g., at the top of your file)
-    # title_llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
+    # Generates a concise, AI-powered title (5 words or less) for a user's query
     
     try:
         # Make sure you have your title_llm defined
-        # prompt = f"Generate a very short, concise title (5 words or less) for this chat query: '{query}'"
-        # response = title_llm.invoke(prompt)
-        # title = response.content.strip().replace('"', '') # Clean up
-        # return title
+        prompt = f"""Generate a very short, concise title (fro side bar title so only give titel) for this chat query: '{query}'"
+        """
+        response = title_llm.invoke(prompt)
+        return response.title.strip()
         
     except Exception as e:
         print(f"Error generating title: {e}")
         # Fallback to a simple truncation
         return query[:30] + "..."
 
-    """
+    
     
     # --- PLACEHOLDER ---
     # Replace this placeholder with your actual LLM call from the example above.
@@ -119,8 +111,7 @@ for thread_id, title in threads_list:
         # Update the message history in session state
         st.session_state['message_history'] = temp_messages
         
-        # Rerun to display the loaded chat
-        st.rerun()
+        
 
 # **************************************** Main Chat UI *********************************
 
@@ -145,23 +136,19 @@ if user_input:
 
     CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
 
-    # Stream the AI response
+    ## Stream model response
     with st.chat_message('assistant'):
-        ai_message_content = ""
-        for message_chunk, metadata in chatbot.stream(
-            {'messages': [HumanMessage(content=user_input)]},
-            config=CONFIG,
-            stream_mode='messages'
-        ):
-            # The last chunk in the 'messages' stream is the AI's final response
-            ai_message_content = message_chunk.content
+        ai_message = st.write_stream(
+            message_chunk.content
+            for message_chunk, metadata in chatbot.stream(
+                {'messages': [HumanMessage(content=user_input)]},
+                config=CONFIG,
+                stream_mode='messages'
+            )
+        )
 
-        # Use st.write_stream on the final, complete content
-        # This is a common pattern if the 'messages' stream mode yields full messages
-        st.markdown(ai_message_content)
-
-    # Add the complete AI message to history
-    st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message_content})
+    # Store assistant reply
+    st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message})
 
     # --- NEW: TITLE GENERATION LOGIC ---
     if is_first_message:

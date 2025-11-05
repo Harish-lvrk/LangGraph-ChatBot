@@ -5,6 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 
 load_dotenv()
@@ -13,6 +14,11 @@ load_dotenv()
 load_dotenv()
 
 llm = ChatGoogleGenerativeAI(model = 'gemini-2.5-flash')
+
+class TitleOnly(BaseModel):
+    title: str = Field(description="Short chat title, max 5 words")
+
+title_llm = llm.with_structured_output(TitleOnly)
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -33,3 +39,5 @@ graph.add_edge("chat_node", END)
 chatbot = graph.compile(checkpointer=checkpointer)
 
 # print(chatbot.invoke({'messages':'hi'},config= {'configurable': {'thread_id': 'thread-1'}}))
+response = title_llm.invoke("Hello, can you give a short title for this chat? qurey: How's the weather today?    ")
+print(response.title)
