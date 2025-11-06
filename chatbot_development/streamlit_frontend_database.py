@@ -271,8 +271,12 @@ if user_input:
     with st.chat_message("user"):
         st.write(user_input)
 
-    # Send to LangGraph
-    CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+    # Send to LangGraph and langsmith
+    CONFIG = {
+        "configurable": {"thread_id": st.session_state["thread_id"]},
+        "metadata": {"thread_id": st.session_state["thread_id"]},
+        "run_name": "chat_turn",
+    }
 
     with st.chat_message("assistant"):
         ai_message = st.write_stream(
