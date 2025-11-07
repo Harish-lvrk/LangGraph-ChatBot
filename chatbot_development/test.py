@@ -1,6 +1,7 @@
 import streamlit as st
 import uuid
 from langchain_core.messages import HumanMessage,AIMessage,ToolMessage
+import json
 
 # Import backend utilities
 from langgraph_tool_backend import (
@@ -116,24 +117,24 @@ if user_input:
 
     # Assistant streaming block
     with st.chat_message("assistant"):
-        # Mutable holder to track tool progress
+        # Mutable holder for tracking the tool status box
         status_holder = {"box": None}
 
-        def ai_only_final_message():
+        def ai_only_stream():
             """
-            Streams chatbot events internally but returns only
-            the final AI text after all tools finish.
+            Stream assistant responses safely, handling tool messages, AI text,
+            and structured JSON outputs gracefully.
             """
-            collected_text = ""
-
             for message_chunk, metadata in chatbot.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=CONFIG,
                 stream_mode="messages",
             ):
-                # 🧩 TOOL MESSAGE — show progress bar
+                # --- TOOL MESSAGE HANDLING ---
                 if isinstance(message_chunk, ToolMessage):
                     tool_name = getattr(message_chunk, "name", "tool")
+
+                    # Create or update tool status box dynamically
                     if status_holder["box"] is None:
                         status_holder["box"] = st.status(
                             f"🔧 Using `{tool_name}` …", expanded=True
@@ -144,48 +145,56 @@ if user_input:
                             state="running",
                             expanded=True,
                         )
-                    continue
 
-                # 🧠 AI MESSAGE — append structured content
-                if isinstance(message_chunk, AIMessage):
-                    content = message_chunk.content
+                    # If tool returns structured content, format it nicely
+                    tool_output = getattr(message_chunk, "content", None)
+                    if isinstance(tool_output, (dict, list)):
+                        yield f"**Tool `{tool_name}` Output:**\n```json\n{json.dumps(tool_output, indent=2)}\n```"
+                    elif isinstance(tool_output, str) and tool_output.strip():
+                        yield tool_output
+
+                # --- AI MESSAGE HANDLING ---
+                elif isinstance(message_chunk, AIMessage):
+                    yield message_chunk.content
+
+                # --- STRUCTURED RAW DICT HANDLING (Fix for JSON output) ---
+                elif isinstance(message_chunk, dict):
+                    # Extract 'content' if exists
+                    content = message_chunk.get("content")
+
                     if isinstance(content, list):
+                        # Handle [{"type": "text", "text": "..."}] structure
                         text_parts = [
-                            part.get("text", "")
-                            for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
+                            part.get("text", "") for part in content if part.get("type") == "text"
                         ]
-                        content = "".join(text_parts)
-                    collected_text += content.strip() + " "
-                    continue
+                        if text_parts:
+                            yield "".join(text_parts)
 
-                # 💬 AI MESSAGE CHUNK — append token-level text
-                from langchain_core.messages import AIMessageChunk
-                if isinstance(message_chunk, AIMessageChunk):
-                    content = getattr(message_chunk, "content", "")
-                    if content:
-                        collected_text += str(content).strip() + " "
-                    continue
+                    elif isinstance(content, str):
+                        yield content
 
-                # Ignore everything else
+                    # Handle tool-like dicts
+                    elif "type" in message_chunk and message_chunk["type"] == "tool":
+                        tool_name = message_chunk.get("name", "unknown_tool")
+                        args = message_chunk.get("args", {})
+                        yield f"🧩 Running `{tool_name}` with args:\n```json\n{json.dumps(args, indent=2)}\n```"
+
+                    else:
+                        # Log any unknown message type for debugging
+                        print("⚠️ Unrecognized message chunk:", message_chunk)
+
+                # --- OTHER MESSAGE TYPES (ignore silently) ---
                 else:
-                    continue
+                    print("ℹ️ Skipped unknown message type:", type(message_chunk))
 
-            # ✅ Return only the final text
-            return collected_text.strip() if collected_text else None
+        # Stream assistant output to UI
+        ai_message = st.write_stream(ai_only_stream())
 
-        # Run and display only the final assistant message
-        ai_message = ai_only_final_message()
-
-        # Update tool status if any were used
+        # Finalize tool status if used
         if status_holder["box"] is not None:
             status_holder["box"].update(
                 label="✅ Tool finished", state="complete", expanded=False
             )
-
-        # Display final AI message cleanly
-        if ai_message:
-            st.markdown(ai_message)
 
     # Save to session history
     st.session_state['message_history'].append({"role": "assistant", "content": ai_message})
