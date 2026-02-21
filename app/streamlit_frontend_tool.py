@@ -1,6 +1,6 @@
 import streamlit as st
 import uuid
-from langchain_core.messages import HumanMessage,AIMessage,ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 # Import backend utilities
 from langgraph_tool_backend import (
@@ -28,8 +28,8 @@ def reset_chat():
     thread_id = generate_threadid()
     st.session_state['thread_id'] = thread_id
 
-    # Insert placeholder title first
-    st.session_state['chat_threads'][thread_id] = "New Chat"
+    # Insert new chat at the beginning (so it appears at top)
+    st.session_state['chat_threads'] = {thread_id: "New Chat", **st.session_state['chat_threads']}
 
     st.session_state['message_history'] = []
 
@@ -51,11 +51,13 @@ if 'chat_threads' not in st.session_state:
 
 if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_threadid()
-    st.session_state['chat_threads'][st.session_state['thread_id']] = "New Chat"
+    # Insert at beginning so new chat appears at top
+    st.session_state['chat_threads'] = {st.session_state['thread_id']: "New Chat", **st.session_state['chat_threads']}
 
 # Ensure current thread exists
 if st.session_state['thread_id'] not in st.session_state['chat_threads']:
-    st.session_state['chat_threads'][st.session_state['thread_id']] = "New Chat"
+    # Insert at beginning so it appears at top
+    st.session_state['chat_threads'] = {st.session_state['thread_id']: "New Chat", **st.session_state['chat_threads']}
 
 # -------------------- Sidebar --------------------
 st.sidebar.title("LangGraph ChatBot")
@@ -66,7 +68,7 @@ if st.sidebar.button("New Chat"):
 
 st.sidebar.subheader("My Conversations")
 
-threads_list = reversed(list(st.session_state['chat_threads'].items()))
+threads_list = list(st.session_state['chat_threads'].items())
 
 for thread_id, title in threads_list:
     if st.sidebar.button(title, key=thread_id, use_container_width=True):
@@ -75,6 +77,14 @@ for thread_id, title in threads_list:
 
         temp_messages = []
         for message in messages:
+            # Skip ToolMessage (raw JSON tool output)
+            if isinstance(message, ToolMessage):
+                continue
+            
+            # Skip AIMessage with empty content (tool call requests)
+            if isinstance(message, AIMessage) and not message.content:
+                continue
+            
             role = "user" if isinstance(message, HumanMessage) else "assistant"
             temp_messages.append({"role": role, "content": message.content})
 

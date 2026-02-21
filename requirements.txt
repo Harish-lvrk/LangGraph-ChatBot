@@ -1,6 +1,17 @@
+# LangGraph & LangChain
 langgraph
-typing
-langchain_core
-langchain_google_genai
-dotenv
+langgraph-checkpoint-sqlite
+langchain-core
+langchain-google-genai
+langchain-community
+
+# DuckDuckGo Search (required by langchain_community.tools.DuckDuckGoSearchRun)
+duckduckgo-search
+
+# Web Framework
 streamlit
+
+# Utilities
+python-dotenv
+requests
+pydantic

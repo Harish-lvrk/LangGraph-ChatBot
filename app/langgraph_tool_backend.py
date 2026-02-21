@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import sqlite3
 import requests
 import os 
+from datetime import datetime
 
 load_dotenv()
 
@@ -77,8 +78,22 @@ def get_weather_data(city: str) -> str:
     response = requests.get(url)
     return response.json()
 
+@tool
+def get_current_datetime() -> dict:
+    """
+    Get the current date and time.
+    Use this tool when the user asks about today's date, current time, day, or datetime.
+    """
+    now = datetime.now()
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+        "day": now.strftime("%A"),
+        "formatted": now.strftime("%A, %B %d, %Y at %I:%M %p")
+    }
+
 #bind the llm with tools
-tools = [search_tool, get_stock_price, calculator,get_weather_data]
+tools = [search_tool, get_stock_price, calculator, get_weather_data, get_current_datetime]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
