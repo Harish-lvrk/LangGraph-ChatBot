@@ -15,3 +15,5 @@ streamlit
 python-dotenv
 requests
 pydantic
+aiosqlite
+langchain-mcp-adapters

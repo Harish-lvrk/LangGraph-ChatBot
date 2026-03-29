@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import sqlite3
 import requests
 import os 
+from datetime import datetime
 
 load_dotenv()
 
@@ -63,7 +64,7 @@ def get_stock_price(symbol: str) -> dict:
     Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
     using Alpha Vantage with API key in the URL.
     """
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=C9PE94QUEW9VWGFM"
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={os.environ.get('ALPHA_VANTAGE_API')}"
     r = requests.get(url)
     return r.json()
 
@@ -77,8 +78,22 @@ def get_weather_data(city: str) -> str:
     response = requests.get(url)
     return response.json()
 
+@tool
+def get_current_datetime() -> dict:
+    """
+    Get the current date and time.
+    Use this tool when the user asks about today's date, current time, day, or datetime.
+    """
+    now = datetime.now()
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+        "day": now.strftime("%A"),
+        "formatted": now.strftime("%A, %B %d, %Y at %I:%M %p")
+    }
+
 #bind the llm with tools
-tools = [search_tool, get_stock_price, calculator,get_weather_data]
+tools = [search_tool, get_stock_price, calculator, get_weather_data, get_current_datetime]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
@@ -150,6 +165,19 @@ def save_thread_title(thread_id: str, title: str):
 def get_all_threads():
     cursor = conn.execute("SELECT thread_id, title FROM threads ORDER BY created_at DESC")
     return {row[0]: row[1] for row in cursor.fetchall()}
+
+# Delete a thread from both the database and checkpoint storage
+def delete_thread(thread_id: str):
+    # Delete from threads table
+    conn.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+    
+    # Delete from checkpoint storage (manually as SqliteSaver might not have .delete())
+    try:
+        conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+        conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        conn.commit()
+    except Exception as e:
+        print(f"Warning: Could not delete checkpoint data for thread {thread_id}: {e}")
 
 
 

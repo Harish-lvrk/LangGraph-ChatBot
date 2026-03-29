@@ -1,13 +1,14 @@
 import streamlit as st
 import uuid
-from langchain_core.messages import HumanMessage,AIMessage,ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 # Import backend utilities
 from langgraph_tool_backend import (
     chatbot,
     title_llm,
     save_thread_title,
-    get_all_threads
+    get_all_threads,
+    delete_thread
 )
 
 # -------------------- Title generation LLM --------------------
@@ -28,10 +29,22 @@ def reset_chat():
     thread_id = generate_threadid()
     st.session_state['thread_id'] = thread_id
 
-    # Insert placeholder title first
-    st.session_state['chat_threads'][thread_id] = "New Chat"
+    # Insert new chat at the beginning (so it appears at top)
+    st.session_state['chat_threads'] = {thread_id: "New Chat", **st.session_state['chat_threads']}
 
     st.session_state['message_history'] = []
+
+def delete_chat(thread_id):
+    # Delete from backend
+    delete_thread(thread_id)
+
+    # Remove from session state
+    if thread_id in st.session_state['chat_threads']:
+        del st.session_state['chat_threads'][thread_id]
+
+    # If we're deleting the current chat, switch to a new one
+    if st.session_state['thread_id'] == thread_id:
+        reset_chat()
 
 def load_conversation(thread_id):
     try:
@@ -40,6 +53,19 @@ def load_conversation(thread_id):
     except Exception as e:
         print(f"Error loading conversation: {e}")
         return []
+
+def extract_message_content(message):
+    """Extract clean text content from AIMessage objects"""
+    content = message.content
+    if isinstance(content, list):
+        # Extract text parts from structured content
+        text_parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "".join(text_parts)
+    return content
 
 # -------------------- Initialize session state --------------------
 if 'message_history' not in st.session_state:
@@ -51,11 +77,17 @@ if 'chat_threads' not in st.session_state:
 
 if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_threadid()
-    st.session_state['chat_threads'][st.session_state['thread_id']] = "New Chat"
+    # Insert at beginning so new chat appears at top
+    st.session_state['chat_threads'] = {st.session_state['thread_id']: "New Chat", **st.session_state['chat_threads']}
 
 # Ensure current thread exists
 if st.session_state['thread_id'] not in st.session_state['chat_threads']:
-    st.session_state['chat_threads'][st.session_state['thread_id']] = "New Chat"
+    # Insert at beginning so it appears at top
+    st.session_state['chat_threads'] = {st.session_state['thread_id']: "New Chat", **st.session_state['chat_threads']}
+
+# Initialize delete confirmations
+if 'delete_confirmations' not in st.session_state:
+    st.session_state.delete_confirmations = {}
 
 # -------------------- Sidebar --------------------
 st.sidebar.title("LangGraph ChatBot")
@@ -66,19 +98,55 @@ if st.sidebar.button("New Chat"):
 
 st.sidebar.subheader("My Conversations")
 
-threads_list = reversed(list(st.session_state['chat_threads'].items()))
+threads_list = list(st.session_state['chat_threads'].items())
+
+# Create a container for delete confirmations
+if 'delete_confirmations' not in st.session_state:
+    st.session_state.delete_confirmations = {}
 
 for thread_id, title in threads_list:
-    if st.sidebar.button(title, key=thread_id, use_container_width=True):
-        st.session_state['thread_id'] = thread_id
-        messages = load_conversation(thread_id)
+    # Check if we need to show confirmation dialog for this thread
+    if st.session_state.delete_confirmations.get(thread_id):
+        col1, col2, col3 = st.sidebar.columns([3, 1, 1])
+        with col1:
+            st.sidebar.write(f"Delete '{title}'?")
+        with col2:
+            if st.sidebar.button("✅", key=f"confirm_{thread_id}"):
+                delete_chat(thread_id)
+                st.session_state.delete_confirmations[thread_id] = False
+                st.rerun()
+        with col3:
+            if st.sidebar.button("❌", key=f"cancel_{thread_id}"):
+                st.session_state.delete_confirmations[thread_id] = False
+                st.rerun()
+    else:
+        col1, col2 = st.sidebar.columns([4, 1])
+        with col1:
+            if st.button(title, key=thread_id, use_container_width=True):
+                st.session_state['thread_id'] = thread_id
+                messages = load_conversation(thread_id)
 
-        temp_messages = []
-        for message in messages:
-            role = "user" if isinstance(message, HumanMessage) else "assistant"
-            temp_messages.append({"role": role, "content": message.content})
+                temp_messages = []
+                for message in messages:
+                    # Skip ToolMessage (raw JSON tool output)
+                    if isinstance(message, ToolMessage):
+                        continue
 
-        st.session_state['message_history'] = temp_messages
+                    # Skip AIMessage with empty content (tool call requests)
+                    if isinstance(message, AIMessage) and not message.content:
+                        continue
+
+                    role = "user" if isinstance(message, HumanMessage) else "assistant"
+                    # Extract clean text content from structured AIMessages
+                    content = extract_message_content(message)
+                    temp_messages.append({"role": role, "content": content})
+
+                st.session_state['message_history'] = temp_messages
+        with col2:
+            # Add delete button for each chat
+            if st.button("🗑️", key=f"delete_{thread_id}", use_container_width=True):
+                st.session_state.delete_confirmations[thread_id] = True
+                st.rerun()
 
 # **************************************** Main Chat UI *********************************
 

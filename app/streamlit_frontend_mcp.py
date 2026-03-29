@@ -1,14 +1,16 @@
 import streamlit as st
 import uuid
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+import queue
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk
 
-# Import backend utilities
-from langgraph_tool_backend import (
+# Import backend utilities from the new MCP backend
+from langraph_mcp_backend import (
     chatbot,
     title_llm,
     save_thread_title,
     get_all_threads,
-    delete_thread
+    delete_thread,
+    submit_async_task
 )
 
 # -------------------- Title generation LLM --------------------
@@ -65,7 +67,7 @@ def extract_message_content(message):
             if isinstance(part, dict) and part.get("type") == "text"
         ]
         return "".join(text_parts)
-    return content
+    return str(content)
 
 # -------------------- Initialize session state --------------------
 if 'message_history' not in st.session_state:
@@ -90,7 +92,7 @@ if 'delete_confirmations' not in st.session_state:
     st.session_state.delete_confirmations = {}
 
 # -------------------- Sidebar --------------------
-st.sidebar.title("LangGraph ChatBot")
+st.sidebar.title("LangGraph MCP ChatBot")
 
 if st.sidebar.button("New Chat"):
     reset_chat()
@@ -155,9 +157,9 @@ messages = st.session_state['message_history']
 
 # Show placeholder title ONLY before first question
 if len(messages) == 0:
-    st.title("Start a conversation")  # or any good placeholder line
+    st.title("Start an MCP conversation")
 
-# Show chat history (after first message, title disappears)
+# Show chat history
 for message in messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -168,14 +170,13 @@ if user_input:
     # Identify if first message for this thread
     current_messages = load_conversation(st.session_state['thread_id'])
     is_first_message = len(current_messages) == 0
-   
 
     # Display user message
     st.session_state['message_history'].append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.write(user_input)
 
-    # Send to LangGraph and langsmith
+    # Send to LangGraph
     CONFIG = {
         "configurable": {"thread_id": st.session_state["thread_id"]},
         "metadata": {"thread_id": st.session_state["thread_id"]},
@@ -184,90 +185,86 @@ if user_input:
 
     # Assistant streaming block
     with st.chat_message("assistant"):
-        # Mutable holder to track tool progress
         status_holder = {"box": None}
+        message_placeholder = st.empty()
+        full_response = ""
 
-        def ai_only_final_message():
-            """
-            Streams chatbot events internally but returns only
-            the final AI text after all tools finish.
-            """
+        def ai_only_stream():
+            event_queue = queue.Queue()
+
+            async def run_stream():
+                try:
+                    async for message_chunk, metadata in chatbot.astream(
+                        {"messages": [HumanMessage(content=user_input)]},
+                        config=CONFIG,
+                        stream_mode="messages",
+                    ):
+                        event_queue.put((message_chunk, metadata))
+                except Exception as exc:
+                    event_queue.put(("error", exc))
+                finally:
+                    event_queue.put(None)
+
+            submit_async_task(run_stream())
+
             collected_text = ""
+            while True:
+                try:
+                    item = event_queue.get(timeout=30)
+                    if item is None:
+                        break
+                    
+                    if isinstance(item, tuple) and item[0] == "error":
+                        st.error(f"Error: {item[1]}")
+                        break
+                    
+                    message_chunk, _ = item
 
-            for message_chunk, metadata in chatbot.stream(
-                {"messages": [HumanMessage(content=user_input)]},
-                config=CONFIG,
-                stream_mode="messages",
-            ):
-                # 🧩 TOOL MESSAGE — show progress bar
-                if isinstance(message_chunk, ToolMessage):
-                    tool_name = getattr(message_chunk, "name", "tool")
-                    if status_holder["box"] is None:
-                        status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}` …", expanded=True
-                        )
-                    else:
-                        status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` …",
-                            state="running",
-                            expanded=True,
-                        )
-                    continue
+                    # Handle ToolMessage
+                    if isinstance(message_chunk, ToolMessage):
+                        tool_name = getattr(message_chunk, "name", "tool")
+                        if status_holder["box"] is None:
+                            status_holder["box"] = st.status(f"🔧 Using `{tool_name}` …", expanded=True)
+                        else:
+                            status_holder["box"].update(label=f"🔧 Using `{tool_name}` …", state="running")
+                        continue
 
-                # 🧠 AI MESSAGE — append structured content
-                if isinstance(message_chunk, AIMessage):
-                    content = message_chunk.content
-                    if isinstance(content, list):
-                        text_parts = [
-                            part.get("text", "")
-                            for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        ]
-                        content = "".join(text_parts)
-                    collected_text += content.strip() + " "
-                    continue
+                    # Handle AIMessage or AIMessageChunk
+                    if isinstance(message_chunk, (AIMessage, AIMessageChunk)):
+                        content = message_chunk.content
+                        if isinstance(content, list):
+                            text_parts = [
+                                part.get("text", "")
+                                for part in content
+                                if isinstance(part, dict) and part.get("type") == "text"
+                            ]
+                            content = "".join(text_parts)
+                        
+                        if content:
+                            collected_text += str(content)
+                            message_placeholder.markdown(collected_text + "▌")
+                    
+                except queue.Empty:
+                    break
+            
+            return collected_text.strip()
 
-                # 💬 AI MESSAGE CHUNK — append token-level text
-                from langchain_core.messages import AIMessageChunk
-                if isinstance(message_chunk, AIMessageChunk):
-                    content = getattr(message_chunk, "content", "")
-                    if content:
-                        collected_text += str(content).strip() + " "
-                    continue
-
-                # Ignore everything else
-                else:
-                    continue
-
-            # ✅ Return only the final text
-            return collected_text.strip() if collected_text else None
-
-        # Run and display only the final assistant message
-        ai_message = ai_only_final_message()
+        # Run and display the assistant message
+        ai_message = ai_only_stream()
 
         # Update tool status if any were used
         if status_holder["box"] is not None:
-            status_holder["box"].update(
-                label="✅ Tool finished", state="complete", expanded=False
-            )
+            status_holder["box"].update(label="✅ Tool finished", state="complete", expanded=False)
 
-        # Display final AI message cleanly
+        # Final clean display
         if ai_message:
-            st.markdown(ai_message)
-
-    # Save to session history
-    st.session_state['message_history'].append({"role": "assistant", "content": ai_message})
+            message_placeholder.markdown(ai_message)
+            st.session_state['message_history'].append({"role": "assistant", "content": ai_message})
 
     # Handle first-message title creation + DB saving
     if is_first_message:
         new_title = get_ai_title_for_query(user_input)
-
         thread_id = st.session_state['thread_id']
-
-        # Save title in DB
         save_thread_title(thread_id, new_title)
-
-        # Update UI dictionary
         st.session_state['chat_threads'][thread_id] = new_title
-
         st.rerun()

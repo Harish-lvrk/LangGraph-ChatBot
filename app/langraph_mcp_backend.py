@@ -1,22 +1,44 @@
+import os
+# Fix for GRPC errors on macOS
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
+os.environ["GRPC_PYTHON_ASYNC_IO_THREADS"] = "1"
 
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_core.tools import tool
-from langgraph.graph.message import add_messages
+from langchain_core.tools import tool, BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+import aiosqlite
 import sqlite3
 import requests
+import asyncio
+import threading
 import os 
 from datetime import datetime
 
 load_dotenv()
 
+# Dedicated async loop for backend tasks
+_ASYNC_LOOP = asyncio.new_event_loop()
+_ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
+_ASYNC_THREAD.start()
+
+def _submit_async(coro):
+    return asyncio.run_coroutine_threadsafe(coro, _ASYNC_LOOP)
+
+def run_async(coro):
+    return _submit_async(coro).result()
+
+def submit_async_task(coro):
+    """Schedule a coroutine on the backend event loop."""
+    return _submit_async(coro)
 
 # -------------------
 # 1. LLM
@@ -28,36 +50,11 @@ class TitleOnly(BaseModel):
 
 title_llm = llm.with_structured_output(TitleOnly)
 
-
 # -------------------
 # 2. Tools
 # -------------------
-# Tools
 search_tool = DuckDuckGoSearchRun(region="us-en")
-@tool
-def calculator(first_num: float, second_num: float, operation: str) -> dict:
-    """
-    Perform a basic arithmetic operation on two numbers.
-    Supported operations: add, sub, mul, div
-    """
-    try:
-        if operation == "add":
-            result = first_num + second_num
-        elif operation == "sub":
-            result = first_num - second_num
-        elif operation == "mul":
-            result = first_num * second_num
-        elif operation == "div":
-            if second_num == 0:
-                return {"error": "Division by zero is not allowed"}
-            result = first_num / second_num
-        else:
-            return {"error": f"Unsupported operation '{operation}'"}
-        
-        return {"first_num": first_num, "second_num": second_num, "operation": operation, "result": result}
-    except Exception as e:
-        return {"error": str(e)}
-    
+
 @tool
 def get_stock_price(symbol: str) -> dict:
     """
@@ -92,9 +89,55 @@ def get_current_datetime() -> dict:
         "formatted": now.strftime("%A, %B %d, %Y at %I:%M %p")
     }
 
-#bind the llm with tools
-tools = [search_tool, get_stock_price, calculator, get_weather_data, get_current_datetime]
-llm_with_tools = llm.bind_tools(tools)
+# MCP Client Configuration
+server_config = {
+    "math": {
+        "transport": "stdio",
+        "command": "/Users/hareesh/Projects/MCPs/.venv/bin/python",
+        "args": [
+            "/Users/hareesh/Projects/MCPs/mcp_servers/basic_server.py"
+        ],
+    },
+    "expenses": {
+        "transport": "http",
+        "url": "https://scientific-gold-iguana.fastmcp.app/mcp",
+        "headers": {
+            "Authorization": "Bearer fmcp_TXWqxiZBiklvK-P8ppubP9cAhXmQHjdHS4V3CKtG6o4"
+        }
+    },
+    "manim-server": {
+        "transport": "stdio",
+        "command": "/Users/hareesh/Projects/manim-mcp-server/.venv/bin/python",
+        "args": [
+            "/Users/hareesh/Projects/manim-mcp-server/src/manim_server.py"
+        ],
+        "env": {
+            "MANIM_EXECUTABLE": "/Users/hareesh/Projects/manim-mcp-server/.venv/bin/manim"
+        }
+    }
+}
+
+client = MultiServerMCPClient(server_config)
+
+def load_mcp_tools() -> list[BaseTool]:
+    try:
+        return run_async(client.get_tools())
+    except Exception as e:
+        print(f"Error loading MCP tools: {e}")
+        return []
+
+mcp_tools = load_mcp_tools()
+
+# Fix for missing 'type' in MCP tool schema properties which breaks Pydantic validation in Gemini
+for t in mcp_tools:
+    if hasattr(t, "args_schema") and isinstance(t.args_schema, dict):
+        props = t.args_schema.get("properties", {})
+        for prop_name, prop_def in props.items():
+            if isinstance(prop_def, dict) and "type" not in prop_def:
+                prop_def["type"] = "string"
+
+tools = [search_tool, get_stock_price, get_weather_data, get_current_datetime, *mcp_tools]
+llm_with_tools = llm.bind_tools(tools) if tools else llm
 
 # -------------------
 # 3. Graph State
@@ -105,101 +148,124 @@ class ChatState(TypedDict):
 # -------------------
 # 4. Nodes
 # -------------------
-def chat_node(state: ChatState):
+async def chat_node(state: ChatState):
     """LLM node that may answer or request a tool call."""
+    print("DEBUG: Entering chat_node", flush=True)
     messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
+    
+    # System instruction for model behavior and tool usage
+    system_prompt = SystemMessage(content=(
+        "You are a helpful assistant with access to several tools. "
+        "IMPORTANT: When calling a tool, you MUST provide all required arguments as specified in the tool's schema. "
+        "For example, when using 'add_expense', you MUST provide 'date', 'amount', and 'category'. "
+        "If the user doesn't provide enough information, ask them for the missing details before calling the tool.\n\n"
+        "ANIMATION RULES: When generating code for Manim animations, you MUST NOT use LaTeX. "
+        "The environment does not support it. Use `Text()` instead of `MathTex()`, "
+        "and avoid any LaTeX-specific formatting or symbols."
+    ))
+    
+    # Prepend the system prompt to the messages sent to the LLM
+    print("DEBUG: Calling LLM...", flush=True)
+    response = await llm_with_tools.ainvoke([system_prompt] + messages)
+    print(f"DEBUG: LLM Response received. Content: {response.content[:100]}...", flush=True)
+    
+    # Safeguard: Ensure tool_calls 'args' are not None to avoid Pydantic validation errors
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        print(f"DEBUG: Tool Calls generated: {response.tool_calls}", flush=True)
+        for tc in response.tool_calls:
+            if tc.get("args") is None:
+                print(f"DEBUG: Fixing null args for tool {tc.get('name')}", flush=True)
+                tc["args"] = {}
+        
     return {"messages": [response]}
 
-tool_node = ToolNode(tools)
+tool_node = ToolNode(tools) if tools else None
 
-# ---------------------- SQLite + Checkpointer ----------------------
 # -------------------
 # 5. Checkpointer
 # -------------------
+async def _init_checkpointer():
+    # Regular connection for standard operations
+    conn = await aiosqlite.connect(database="chatbot.db")
+    # Initialize threads table
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS threads (
+        thread_id TEXT PRIMARY KEY,
+        title TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    await conn.commit()
+    return AsyncSqliteSaver(conn)
 
-conn = sqlite3.connect("chatbot.db", check_same_thread=False)
-
-# Create table for storing sidebar chat titles
-conn.execute("""
-CREATE TABLE IF NOT EXISTS threads (
-    thread_id TEXT PRIMARY KEY,
-    title TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
-
-# LangGraph checkpointing (stores chat messages)
-checkpointer = SqliteSaver(conn=conn)
+checkpointer = run_async(_init_checkpointer())
 
 # -------------------
 # 6. Graph
 # -------------------
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
-graph.add_node("tools", tool_node)
-
 graph.add_edge(START, "chat_node")
 
-graph.add_conditional_edges("chat_node",tools_condition)
-graph.add_edge('tools', 'chat_node')
+if tool_node:
+    graph.add_node("tools", tool_node)
+    graph.add_conditional_edges("chat_node", tools_condition)
+    graph.add_edge("tools", "chat_node")
+else:
+    graph.add_edge("chat_node", END)
 
 chatbot = graph.compile(checkpointer=checkpointer)
-
-
 
 # -------------------
 # 7. Helper
 # -------------------
 
-# Store title in DB
+# Store title in DB (Keep sync interface for frontend if possible, or use run_async)
 def save_thread_title(thread_id: str, title: str):
-    conn.execute(
-        "INSERT OR REPLACE INTO threads (thread_id, title) VALUES (?, ?)",
-        (thread_id, title)
-    )
-    conn.commit()
+    def _save():
+        conn_sync = sqlite3.connect("chatbot.db")
+        conn_sync.execute(
+            "INSERT OR REPLACE INTO threads (thread_id, title) VALUES (?, ?)",
+            (thread_id, title)
+        )
+        conn_sync.commit()
+        conn_sync.close()
+    
+    _save()
 
 # Fetch all thread titles from DB -> dict format {thread_id: title}
 def get_all_threads():
-    cursor = conn.execute("SELECT thread_id, title FROM threads ORDER BY created_at DESC")
-    return {row[0]: row[1] for row in cursor.fetchall()}
+    conn_sync = sqlite3.connect("chatbot.db")
+    cursor = conn_sync.execute("SELECT thread_id, title FROM threads ORDER BY created_at DESC")
+    results = {row[0]: row[1] for row in cursor.fetchall()}
+    conn_sync.close()
+    return results
 
 # Delete a thread from both the database and checkpoint storage
 def delete_thread(thread_id: str):
-    # Delete from threads table
-    conn.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
-    
-    # Delete from checkpoint storage (manually as SqliteSaver might not have .delete())
     try:
-        conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
-        conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
-        conn.commit()
+        conn_sync = sqlite3.connect("chatbot.db")
+        # Delete from threads table
+        conn_sync.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+        
+        # Manually delete checkpoint data to avoid SqliteSaver issues
+        conn_sync.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+        conn_sync.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        conn_sync.commit()
+        conn_sync.close()
     except Exception as e:
-        print(f"Warning: Could not delete checkpoint data for thread {thread_id}: {e}")
+        print(f"Warning: Could not delete thread {thread_id}: {e}")
 
+# ---------------------- For debugging ----------------------
+async def _alist_threads():
+    all_threads = set()
+    async for checkpoint in checkpointer.alist(None):
+        all_threads.add(checkpoint.config["configurable"]["thread_id"])
+    return list(all_threads)
 
-
-
-
-
-
-
-# ---------------------- For debugging only ----------------------
-# Print existing thread IDs in message DB
-def list_message_threads():
-    threads = set()
-    for checkpoint in checkpointer.list(None):
-        threads.add(checkpoint.config["configurable"]["thread_id"])
-    return threads
+def retrieve_all_threads():
+    return run_async(_alist_threads())
 
 if __name__ == "__main__":
-    # CONFIG = {'configurable':{'thread_id':'thread-1'}}
-    # response = chatbot.invoke(
-    #                 {'messages':[HumanMessage(content="explain about the qlora")]},
-    #                 config= CONFIG
-    #                     )
-    # print(response)
-    print("Message threads in checkpoint store:", list_message_threads())
-    print("Title records in DB:", get_all_threads())
+    print("Available tools:", [t.name for t in tools])
+    print("Threads record in DB:", get_all_threads())
